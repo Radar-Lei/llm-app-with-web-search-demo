@@ -5,7 +5,8 @@ LLM App with Web Search
 import asyncio
 import os
 import tempfile
-from urllib.parse import urlparse
+import re
+from urllib.parse import urlparse, quote_plus
 from urllib.robotparser import RobotFileParser
 
 import chromadb
@@ -17,9 +18,9 @@ from crawl4ai import AsyncWebCrawler, BrowserConfig, CacheMode, CrawlerRunConfig
 from crawl4ai.content_filter_strategy import BM25ContentFilter
 from crawl4ai.markdown_generation_strategy import DefaultMarkdownGenerator
 from crawl4ai.models import CrawlResult
-from duckduckgo_search import DDGS
 from langchain_community.document_loaders import UnstructuredMarkdownLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
+import re
 
 system_prompt = """
 You are an AI assistant tasked with providing detailed answers based solely on the given context.
@@ -78,7 +79,7 @@ def call_llm(prompt: str, with_context: bool = True, context: str | None = None)
         messages.pop(0)
         messages[0]["content"] = prompt
 
-    response = ollama.chat(model="llama3.2:3b", stream=True, messages=messages)
+    response = ollama.chat(model="deepseek-r1:32b", stream=True, messages=messages)
 
     for chunk in response:
         if chunk["done"] is False:
@@ -100,7 +101,7 @@ def get_vector_collection() -> tuple[chromadb.Collection, chromadb.Client]:
     """
     ollama_ef = OllamaEmbeddingFunction(
         url="http://localhost:11434/api/embeddings",
-        model_name="nomic-embed-text:latest",
+        model_name="paraphrase-multilingual:latest",
     )
 
     chroma_client = chromadb.PersistentClient(
@@ -213,7 +214,11 @@ async def crawl_webpages(urls: list[str], prompt: str) -> CrawlResult:
         Configures crawler to exclude navigation elements, forms, images etc.
         Runs in headless browser mode with text-only extraction.
     """
-    bm25_filter = BM25ContentFilter(user_query=prompt, bm25_threshold=1.2)
+    if re.search(r'[\u4e00-\u9fff]', prompt):
+        bm25_filter = BM25ContentFilter(user_query=prompt, bm25_threshold=0.8)
+    else:
+        bm25_filter = BM25ContentFilter(user_query=prompt, bm25_threshold=1.2)
+        
     md_generator = DefaultMarkdownGenerator(content_filter=bm25_filter)
 
     crawler_config = CrawlerRunConfig(
@@ -262,37 +267,168 @@ def check_robots_txt(urls: list[str]) -> list[str]:
     return allowed_urls
 
 
-def get_web_urls(search_term: str, num_results: int = 10) -> list[str]:
-    """Performs a web search and returns filtered URLs.
+async def get_web_urls(search_term: str, num_results: int = 10) -> list[str]:
+    """使用 crawl4ai 通过 Bing 搜索并返回过滤后的 URL。
 
-    Uses DuckDuckGo search to find relevant web pages, excluding certain domains and checking
-    robots.txt compliance.
+    使用无头浏览器访问 Bing 搜索页面，解析搜索结果并提取链接，
+    排除某些域名并检查 robots.txt 合规性。
 
     Args:
-        search_term (str): The search query to use
-        num_results (int, optional): Maximum number of search results to return. Defaults to 10.
+        search_term (str): 要使用的搜索查询
+        num_results (int, optional): 返回的最大搜索结果数量。默认为 10。
 
     Returns:
-        list[str]: List of URLs that are allowed to be crawled according to robots.txt
+        list[str]: 根据 robots.txt 允许爬取的 URL 列表
 
     Raises:
-        Exception: If web search fails, prints error message and stops execution
+        Exception: 如果网络搜索失败，打印错误消息并停止执行
     """
     try:
-        discard_urls = ["youtube.com", "britannica.com", "vimeo.com"]
-        for url in discard_urls:
-            search_term += f" -site:{url}"
-
-        results = DDGS().text(search_term, max_results=num_results)
-        results = [result["href"] for result in results]
-
-        return check_robots_txt(results)
-
+        # 构建 Bing 搜索 URL
+        discard_domains = ["youtube.com", "britannica.com", "vimeo.com"]
+        query = search_term
+        # 检查是否包含中文字符
+        if not re.search(r'[\u4e00-\u9fff]', query):
+            for domain in discard_domains:
+                query += f" -site:{domain}"
+        
+        encoded_query = quote_plus(query)
+        search_url = f"https://www.bing.com/search?q={encoded_query}&count={num_results}"
+        
+        print(f"正在搜索: {search_url}")
+        
+        # 配置爬虫
+        crawler_config = CrawlerRunConfig(
+            excluded_tags=["nav", "footer", "header", "form", "img"],
+            only_text=False,  # 我们需要保留链接
+            exclude_social_media_links=False,
+            keep_data_attributes=False,
+            cache_mode=CacheMode.BYPASS,
+            remove_overlay_elements=True,
+            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
+            page_timeout=30000,  # 30 秒超时
+            delay_before_return_html=3.0,  # 等待页面加载
+        )
+        
+        browser_config = BrowserConfig(
+            headless=True, 
+            text_mode=False,  # 需要 HTML 来提取链接
+            light_mode=True
+        )
+        
+        # 爬取搜索结果页面
+        async with AsyncWebCrawler(config=browser_config) as crawler:
+            result = await crawler.arun(url=search_url, config=crawler_config)
+            
+            if not result.html:
+                raise Exception("无法获取搜索结果页面的 HTML 内容")
+            
+            # 解析搜索结果链接
+            urls = extract_bing_links(result.html, num_results)
+            
+            if not urls:
+                print("未找到搜索结果链接")
+                return []
+            
+            print(f"找到 {len(urls)} 个搜索结果")
+            
+            # 检查 robots.txt 合规性
+            return check_robots_txt(urls)
+            
     except Exception as e:
-        error_msg = ("❌ Failed to fetch results from the web", str(e))
+        error_msg = f"❌ 从网络获取结果失败: {str(e)}"
         print(error_msg)
         st.write(error_msg)
         st.stop()
+
+
+def extract_bing_links(html: str, max_results: int = 10) -> list[str]:
+    """从 Bing 搜索结果 HTML 中提取链接。
+
+    Args:
+        html (str): Bing 搜索结果页面的 HTML 内容
+        max_results (int): 提取的最大链接数量
+
+    Returns:
+        list[str]: 提取的 URL 列表
+    """
+    from urllib.parse import unquote
+    
+    urls = []
+    
+    # 模式 1: Bing 搜索结果链接 - 查找标题链接
+    # Bing 通常在 h2 标签中包含结果标题链接
+    title_pattern = r'<h2[^>]*><a[^>]*href=["\']([^"\']+)["\']'
+    title_matches = re.findall(title_pattern, html, re.IGNORECASE)
+    
+    for href in title_matches:
+        try:
+            if href.startswith(('http://', 'https://')):
+                # 排除 Bing 和 Microsoft 相关的域名
+                exclude_domains = ['bing.com', 'microsoft.com', 'msn.com', 'live.com']
+                if not any(domain in href for domain in exclude_domains):
+                    urls.append(href)
+                    if len(urls) >= max_results:
+                        break
+        except Exception:
+            continue
+    
+    # 模式 2: 查找所有以 http 开头的链接，但排除导航和广告链接
+    general_pattern = r'href=["\']([^"\']*(?:https?://[^"\']+))["\']'
+    general_matches = re.findall(general_pattern, html)
+    
+    exclude_domains = ['bing.com', 'microsoft.com', 'msn.com', 'live.com', 'microsofttranslator.com']
+    exclude_keywords = ['privacy', 'terms', 'help', 'support', 'feedback', 'advertising']
+    
+    for href in general_matches:
+        try:
+            if href.startswith(('http://', 'https://')):
+                # 排除特定域名和关键词
+                if (not any(domain in href for domain in exclude_domains) and
+                    not any(keyword in href.lower() for keyword in exclude_keywords)):
+                    
+                    # 确保链接看起来是真实的内容页面
+                    if len(href) > 20 and '.' in href:  # 基本的有效性检查
+                        urls.append(href)
+                        if len(urls) >= max_results:
+                            break
+        except Exception:
+            continue
+    
+    # 模式 3: 查找特定的结果链接类
+    result_link_pattern = r'<cite[^>]*>([^<]+)</cite>'
+    cite_matches = re.findall(result_link_pattern, html, re.IGNORECASE)
+    
+    for cite_text in cite_matches:
+        try:
+            # 从 cite 标签的文本中提取 URL
+            if cite_text.startswith(('http://', 'https://')):
+                exclude_domains = ['bing.com', 'microsoft.com', 'msn.com', 'live.com']
+                if not any(domain in cite_text for domain in exclude_domains):
+                    urls.append(cite_text.split(' ')[0])  # 取第一个可能的 URL
+                    if len(urls) >= max_results:
+                        break
+            elif '/' in cite_text and '.' in cite_text:
+                # 可能是省略了协议的 URL
+                full_url = f"https://{cite_text.split(' ')[0]}"
+                exclude_domains = ['bing.com', 'microsoft.com', 'msn.com', 'live.com']
+                if not any(domain in full_url for domain in exclude_domains):
+                    urls.append(full_url)
+                    if len(urls) >= max_results:
+                        break
+        except Exception:
+            continue
+    
+    # 去重
+    unique_urls = []
+    seen = set()
+    for url in urls:
+        if url not in seen:
+            unique_urls.append(url)
+            seen.add(url)
+    
+    print(f"提取到 {len(unique_urls)} 个唯一链接")
+    return unique_urls[:max_results]
 
 
 async def run():
@@ -313,7 +449,7 @@ async def run():
 
     if prompt and go:
         if is_web_search:
-            web_urls = get_web_urls(search_term=prompt)
+            web_urls = await get_web_urls(search_term=prompt)
             if not web_urls:
                 st.write("No results found.")
                 st.stop()
