@@ -9,10 +9,10 @@ from urllib.parse import urlparse
 from urllib.robotparser import RobotFileParser
 
 import chromadb
-import ollama
+import lmstudio as lms
 import streamlit as st
 from chromadb.config import Settings
-from chromadb.utils.embedding_functions import OllamaEmbeddingFunction
+from chromadb.utils import embedding_functions
 from crawl4ai import AsyncWebCrawler, BrowserConfig, CacheMode, CrawlerRunConfig
 from crawl4ai.content_filter_strategy import BM25ContentFilter
 from crawl4ai.markdown_generation_strategy import DefaultMarkdownGenerator
@@ -20,6 +20,7 @@ from crawl4ai.models import CrawlResult
 from duckduckgo_search import DDGS
 from langchain_community.document_loaders import UnstructuredMarkdownLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
+import re
 
 system_prompt = """
 You are an AI assistant tasked with providing detailed answers based solely on the given context.
@@ -50,7 +51,7 @@ Important: Base your entire response solely on the information provided in the c
 
 
 def call_llm(prompt: str, with_context: bool = True, context: str | None = None):
-    """Calls the LLM model with the given prompt and optional context.
+    """Calls the LM Studio model with the given prompt and optional context.
 
     Args:
         prompt (str): The user prompt/question to send to the LLM
@@ -63,34 +64,30 @@ def call_llm(prompt: str, with_context: bool = True, context: str | None = None)
     Returns:
         Generator[str, None, None]: A generator yielding response chunks
     """
-    messages = [
-        {
-            "role": "system",
-            "content": system_prompt,
-        },
-        {
-            "role": "user",
-            "content": f"Context: {context}, Question: {prompt}",
-        },
-    ]
+    # 初始化LM Studio模型
+    model = lms.llm("deepseek-r1-distill-qwen-32b")
+    
+    if with_context:
+        # 创建一个聊天对象，包含系统提示
+        chat = lms.Chat(system_prompt)
+        # 添加用户消息
+        chat.add_user_message(f"Context: {context}, Question: {prompt}")
+    else:
+        # 不使用系统上下文，直接创建聊天
+        chat = lms.Chat()
+        chat.add_user_message(prompt)
 
-    if not with_context:
-        messages.pop(0)
-        messages[0]["content"] = prompt
-
-    response = ollama.chat(model="llama3.2:3b", stream=True, messages=messages)
-
-    for chunk in response:
-        if chunk["done"] is False:
-            yield chunk["message"]["content"]
-        else:
-            break
+    # 使用流式响应
+    prediction_stream = model.respond_stream(chat)
+    
+    for fragment in prediction_stream:
+        yield fragment.content
 
 
 def get_vector_collection() -> tuple[chromadb.Collection, chromadb.Client]:
     """Creates or retrieves a vector collection for storing embeddings.
 
-    Creates an embedding function using Ollama and initializes a persistent ChromaDB client.
+    Creates an embedding function using HuggingFace and initializes a persistent ChromaDB client.
     Returns both the collection and client objects.
 
     Returns:
@@ -98,9 +95,8 @@ def get_vector_collection() -> tuple[chromadb.Collection, chromadb.Client]:
             - The ChromaDB collection for storing embeddings
             - The ChromaDB client instance
     """
-    ollama_ef = OllamaEmbeddingFunction(
-        url="http://localhost:11434/api/embeddings",
-        model_name="nomic-embed-text:latest",
+    hg_embeddings = embedding_functions.SentenceTransformerEmbeddingFunction(
+        model_name="sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
     )
 
     chroma_client = chromadb.PersistentClient(
@@ -109,7 +105,7 @@ def get_vector_collection() -> tuple[chromadb.Collection, chromadb.Client]:
     return (
         chroma_client.get_or_create_collection(
             name="web_llm",
-            embedding_function=ollama_ef,
+            embedding_function=hg_embeddings,
             metadata={"hnsw:space": "cosine"},
         ),
         chroma_client,
@@ -166,7 +162,7 @@ def add_to_vector_database(results: list[CrawlResult]):
         text_splitter = RecursiveCharacterTextSplitter(
             chunk_size=400,
             chunk_overlap=100,
-            separators=["\n\n", "\n", ".", "?", "!", " ", ""],
+            separators=["\n\n", "\n", "。", "？", "！", "；", ".", "?", "!", " ", ""],
         )
         if result.markdown_v2:
             markdown_result = result.markdown_v2.fit_markdown
@@ -197,6 +193,9 @@ def add_to_vector_database(results: list[CrawlResult]):
                 ids=ids,
             )
 
+def is_chinese(text):
+    return bool(re.search(r'[\u4e00-\u9fff]', text))
+
 
 async def crawl_webpages(urls: list[str], prompt: str) -> CrawlResult:
     """Asynchronously crawls multiple webpages and extracts relevant content based on a prompt.
@@ -213,7 +212,11 @@ async def crawl_webpages(urls: list[str], prompt: str) -> CrawlResult:
         Configures crawler to exclude navigation elements, forms, images etc.
         Runs in headless browser mode with text-only extraction.
     """
-    bm25_filter = BM25ContentFilter(user_query=prompt, bm25_threshold=1.2)
+    if is_chinese(prompt):
+        bm25_filter = BM25ContentFilter(user_query=prompt, bm25_threshold=0.8)
+    else:
+        bm25_filter = BM25ContentFilter(user_query=prompt, bm25_threshold=1.2)
+
     md_generator = DefaultMarkdownGenerator(content_filter=bm25_filter)
 
     crawler_config = CrawlerRunConfig(
@@ -262,7 +265,7 @@ def check_robots_txt(urls: list[str]) -> list[str]:
     return allowed_urls
 
 
-def get_web_urls(search_term: str, num_results: int = 10) -> list[str]:
+def get_web_urls(search_term: str, num_results: int = 8) -> list[str]:
     """Performs a web search and returns filtered URLs.
 
     Uses DuckDuckGo search to find relevant web pages, excluding certain domains and checking

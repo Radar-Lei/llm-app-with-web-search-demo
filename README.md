@@ -12,16 +12,9 @@ Watch the video 👇
 ## Prerequisites
 
 - **🐍 Python3.11**
-- [🦙 Ollama](https://ollama.com/download)
-- Download LLM model to use:
-  ```sh
-  ollama pull llama3.2
-  ```
-- Download embedding model:
-
-    ```sh
-    ollama pull nomic-embed-text:latest
-    ```
+- [🏠 LM Studio](https://lmstudio.ai/)
+- 在LM Studio中下载并加载模型：`deepseek-r1-distill-qwen-32b`
+- 确保LM Studio服务器正在运行（默认端口1234）
 
 
 ## 🔨 Application Setup
