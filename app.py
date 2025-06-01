@@ -21,6 +21,55 @@ from crawl4ai.models import CrawlResult
 from langchain_community.document_loaders import UnstructuredMarkdownLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 
+# 语言配置
+TEXTS = {
+    "zh": {
+        "page_title": "大模型网络搜索",
+        "header": "🔍 大模型+网络搜索",
+        "query_placeholder": "在此输入您的查询...",
+        "enable_web_search": "启用网络搜索",
+        "go_button": "⚡️ 开始",
+        "lang_button": "🌐 English",
+        "searching": "🔍 开始搜索",
+        "found_urls": "📝 找到 {} 个URL，开始爬取...",
+        "no_results": "❌ 未找到搜索结果。",
+        "adding_to_db": "💾 将内容添加到向量数据库...",
+        "querying_db": "🔎 从向量数据库查询相关内容...",
+        "found_docs": "✅ 找到 {} 个相关文档片段，总长度: {} 字符",
+        "no_context": "⚠️ 警告: 未找到相关的上下文内容",
+        "generating": "🤖 生成回答...",
+        "web_search_failed": "❌ 从网络获取结果失败"
+    },
+    "en": {
+        "page_title": "LLM with Web Search",
+        "header": "🔍 LLM with Web Search",
+        "query_placeholder": "Add your query here...",
+        "enable_web_search": "Enable web search",
+        "go_button": "⚡️ Go",
+        "lang_button": "🌐 中文",
+        "searching": "🔍 Searching",
+        "found_urls": "📝 Found {} URLs, starting to crawl...",
+        "no_results": "❌ No search results found.",
+        "adding_to_db": "💾 Adding content to vector database...",
+        "querying_db": "🔎 Querying relevant content from vector database...",
+        "found_docs": "✅ Found {} relevant document fragments, total length: {} characters",
+        "no_context": "⚠️ Warning: No relevant context content found",
+        "generating": "🤖 Generating response...",
+        "web_search_failed": "❌ Failed to get results from web"
+    }
+}
+
+def get_text(key: str) -> str:
+    """获取当前语言的文本"""
+    current_lang = st.session_state.get("language", "zh")
+    return TEXTS[current_lang].get(key, key)
+
+def toggle_language():
+    """切换语言"""
+    current_lang = st.session_state.get("language", "zh")
+    new_lang = "en" if current_lang == "zh" else "zh"
+    st.session_state.language = new_lang
+
 system_prompt = """
 You are an AI assistant tasked with providing detailed answers based solely on the given context.
 Your goal is to analyze the information provided and formulate a comprehensive, well-structured response to the question.
@@ -388,7 +437,7 @@ async def get_web_urls(search_term: str, num_results: int = 20) -> list[str]:
             return check_robots_txt(urls)
             
     except Exception as e:
-        error_msg = f"❌ 从网络获取结果失败: {str(e)}"
+        error_msg = f"{get_text('web_search_failed')}: {str(e)}"
         print(error_msg)
         st.write(error_msg)
         st.stop()
@@ -484,37 +533,49 @@ def extract_bing_links(html: str, max_results: int = 10) -> list[str]:
 
 
 async def run():
-    st.set_page_config(page_title="LLM with Web Search")
+    # 初始化语言状态
+    if "language" not in st.session_state:
+        st.session_state.language = "zh"
 
-    st.header("🔍 大模型+网络搜索LLM Web Search")
+    st.set_page_config(page_title=get_text("page_title"))
+
+    # 创建头部布局，包含标题和语言切换按钮
+    col1, col2 = st.columns([4, 1])
+    
+    with col1:
+        st.header(get_text("header"))
+    
+    with col2:
+        if st.button(get_text("lang_button"), key="lang_toggle"):
+            toggle_language()
+            st.rerun()
+
     prompt = st.text_area(
         label="Put your query here",
-        placeholder="Add your query...",
+        placeholder=get_text("query_placeholder"),
         label_visibility="hidden",
     )
-    is_web_search = st.toggle("Enable web search", value=False, key="enable_web_search")
-    go = st.button(
-        "⚡️ Go",
-    )
+    is_web_search = st.toggle(get_text("enable_web_search"), value=False, key="enable_web_search")
+    go = st.button(get_text("go_button"))
 
     collection, chroma_client = get_vector_collection()
 
     if prompt and go:
         if is_web_search:
-            st.write(f"🔍 开始搜索: {prompt}")
+            st.write(f"{get_text('searching')}: {prompt}")
             
             web_urls = await get_web_urls(search_term=prompt)
             if not web_urls:
-                st.write("❌ 未找到搜索结果。")
+                st.write(get_text("no_results"))
                 st.stop()
 
-            st.write(f"📝 找到 {len(web_urls)} 个URL，开始爬取...")
+            st.write(get_text("found_urls").format(len(web_urls)))
             results = await crawl_webpages(urls=web_urls, prompt=prompt)
             
-            st.write("💾 将内容添加到向量数据库...")
+            st.write(get_text("adding_to_db"))
             add_to_vector_database(results)
 
-            st.write("🔎 从向量数据库查询相关内容...")
+            st.write(get_text("querying_db"))
             qresults = collection.query(query_texts=[prompt], n_results=10)
             context_docs = qresults.get("documents")[0] if qresults.get("documents") else []
             
@@ -524,17 +585,17 @@ async def run():
                 total_context_length = sum(len(doc) for doc in context_docs)
                 print(f"上下文总长度: {total_context_length} 字符")
                 context = " ".join(context_docs)
-                st.write(f"✅ 找到 {len(context_docs)} 个相关文档片段，总长度: {total_context_length} 字符")
+                st.write(get_text("found_docs").format(len(context_docs), total_context_length))
             else:
                 context = ""
-                st.write("⚠️ 警告: 未找到相关的上下文内容")
+                st.write(get_text("no_context"))
                 print("警告: 向量查询返回空结果")
 
             chroma_client.delete_collection(
                 name="web_llm"
             )  # Delete collection after use
 
-            st.write("🤖 生成回答...")
+            st.write(get_text("generating"))
             llm_response = call_llm(
                 context=context, prompt=prompt, with_context=is_web_search
             )
