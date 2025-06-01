@@ -156,7 +156,7 @@ class CreditReportProcessor:
             metadata={"hnsw:space": "cosine"},
         )
     
-    def search_applicant_info(self, applicant_name: str, num_results: int = 20) -> list[str]:
+    def search_applicant_info(self, applicant_name: str, num_results: int = 30) -> list[str]:
         """搜索申请人企业信息"""
         import asyncio
         
@@ -185,7 +185,7 @@ class CreditReportProcessor:
             st.error(f"搜索失败: {str(e)}")
             return []
     
-    async def get_web_urls(self, search_term: str, num_results: int = 5, debug_mode: bool = False) -> list[str]:
+    async def get_web_urls(self, search_term: str, num_results: int = 10, debug_mode: bool = False) -> list[str]:
         """通过Bing搜索获取URL"""
         try:
             query = search_term
@@ -327,7 +327,7 @@ class CreditReportProcessor:
     async def _crawl_webpages_async(self, urls: list[str], query: str) -> list[CrawlResult]:
         """异步爬取网页内容"""
         try:
-            bm25_filter = BM25ContentFilter(user_query=query, bm25_threshold=0.5)
+            bm25_filter = BM25ContentFilter(user_query=query, bm25_threshold=0.1)
             md_generator = DefaultMarkdownGenerator(content_filter=bm25_filter)
 
             crawler_config = CrawlerRunConfig(
@@ -355,7 +355,12 @@ class CreditReportProcessor:
         """将爬取结果添加到向量数据库"""
         total_documents = 0
         
-        for result in results:
+        # 添加调试信息打印
+        print("\n" + "="*80)
+        print("📚 开始将网页内容加入向量数据库")
+        print("="*80)
+        
+        for result_idx, result in enumerate(results, 1):
             documents, metadatas, ids = [], [], []
             
             text_splitter = RecursiveCharacterTextSplitter(
@@ -367,7 +372,17 @@ class CreditReportProcessor:
             if result.markdown_v2 and result.markdown_v2.fit_markdown:
                 markdown_result = result.markdown_v2.fit_markdown
             else:
+                print(f"⚠️  网页 {result_idx}: {result.url} - 无有效内容，跳过")
                 continue
+
+            print(f"\n🌐 网页 {result_idx}: {result.url}")
+            print(f"📄 原始内容长度: {len(markdown_result)} 字符")
+            
+            # 显示原始内容的前500字符作为预览
+            print("📝 内容预览:")
+            print("-" * 50)
+            print(markdown_result[:500] + ("..." if len(markdown_result) > 500 else ""))
+            print("-" * 50)
 
             temp_file = tempfile.NamedTemporaryFile("w", suffix=".md", delete=False, encoding='utf-8')
             temp_file.write(markdown_result)
@@ -377,7 +392,8 @@ class CreditReportProcessor:
                 loader = UnstructuredMarkdownLoader(temp_file.name, mode="single")
                 docs = loader.load()
                 all_splits = text_splitter.split_documents(docs)
-            except Exception:
+            except Exception as e:
+                print(f"❌ 文档处理失败: {str(e)}")
                 all_splits = []
             finally:
                 os.unlink(temp_file.name)
@@ -385,10 +401,19 @@ class CreditReportProcessor:
             normalized_url = self.normalize_url(result.url)
 
             if all_splits:
+                print(f"📊 分割为 {len(all_splits)} 个文档片段")
+                
                 for idx, split in enumerate(all_splits):
                     documents.append(split.page_content)
                     metadatas.append({"source": result.url})
                     ids.append(f"{normalized_url}_{idx}")
+                    
+                    # 打印每个文档片段的信息
+                    print(f"\n  📑 片段 {idx + 1}:")
+                    print(f"     🔗 来源: {result.url}")
+                    print(f"     📏 长度: {len(split.page_content)} 字符")
+                    print(f"     🏷️  ID: {normalized_url}_{idx}")
+                    print(f"     📝 内容预览: {split.page_content[:200]}...")
 
                 self.collection.upsert(
                     documents=documents,
@@ -396,6 +421,30 @@ class CreditReportProcessor:
                     ids=ids,
                 )
                 total_documents += len(documents)
+                print(f"✅ 成功添加 {len(documents)} 个文档片段到数据库")
+            else:
+                print("⚠️  无有效文档片段生成")
+        
+        print(f"\n🎯 总计添加了 {total_documents} 个文档片段到向量数据库")
+        print("="*80)
+        
+        # 如果是Streamlit环境，也在界面上显示
+        if 'st' in globals() and hasattr(st, 'session_state'):
+            st.success(f"✅ 数据库更新完成：共添加 {total_documents} 个文档片段")
+            
+            # 显示数据库中的内容概要
+            if total_documents > 0:
+                with st.expander("📊 查看添加到数据库的内容详情", expanded=False):
+                    for result_idx, result in enumerate(results, 1):
+                        if result.markdown_v2 and result.markdown_v2.fit_markdown:
+                            st.write(f"**网页 {result_idx}:** {result.url}")
+                            st.write(f"内容长度: {len(result.markdown_v2.fit_markdown)} 字符")
+                            st.text_area(
+                                f"内容预览 (网页 {result_idx})",
+                                result.markdown_v2.fit_markdown[:1000] + ("..." if len(result.markdown_v2.fit_markdown) > 1000 else ""),
+                                height=200,
+                                key=f"content_preview_{result_idx}"
+                            )
         
         return total_documents
     
@@ -643,6 +692,97 @@ class CreditReportProcessor:
             }
         except Exception:
             return {"count": 0, "size": "0 MB"}
+    
+    def get_database_info(self):
+        """获取向量数据库信息"""
+        try:
+            # 获取数据库中的文档总数
+            collection_count = self.collection.count()
+            
+            # 获取一些示例文档来展示数据库内容
+            if collection_count > 0:
+                sample_results = self.collection.get(limit=min(10, collection_count))
+                return {
+                    "total_documents": collection_count,
+                    "sample_documents": sample_results.get("documents", []),
+                    "sample_metadatas": sample_results.get("metadatas", []),
+                    "sample_ids": sample_results.get("ids", [])
+                }
+            else:
+                return {
+                    "total_documents": 0,
+                    "sample_documents": [],
+                    "sample_metadatas": [],
+                    "sample_ids": []
+                }
+        except Exception as e:
+            print(f"获取数据库信息失败: {str(e)}")
+            return {
+                "total_documents": 0,
+                "sample_documents": [],
+                "sample_metadatas": [],
+                "sample_ids": []
+            }
+    
+    def print_database_contents(self):
+        """打印数据库中的所有内容"""
+        try:
+            print("\n" + "="*80)
+            print("🗃️ 向量数据库内容详情")
+            print("="*80)
+            
+            collection_count = self.collection.count()
+            print(f"📊 数据库中总文档数: {collection_count}")
+            
+            if collection_count == 0:
+                print("📭 数据库为空")
+                print("="*80)
+                return
+            
+            # 获取所有文档
+            all_results = self.collection.get()
+            documents = all_results.get("documents", [])
+            metadatas = all_results.get("metadatas", [])
+            ids = all_results.get("ids", [])
+            
+            # 按来源URL分组显示
+            url_groups = {}
+            for i, (doc, metadata, doc_id) in enumerate(zip(documents, metadatas, ids)):
+                source_url = metadata.get("source", "未知来源")
+                if source_url not in url_groups:
+                    url_groups[source_url] = []
+                url_groups[source_url].append({
+                    "id": doc_id,
+                    "content": doc,
+                    "index": i
+                })
+            
+            # 打印每个来源的文档
+            for url, docs in url_groups.items():
+                print(f"\n🌐 来源网站: {url}")
+                print(f"📑 文档片段数: {len(docs)}")
+                print("-" * 60)
+                
+                for j, doc_info in enumerate(docs):
+                    print(f"\n  📄 片段 {j + 1}:")
+                    print(f"     🏷️  ID: {doc_info['id']}")
+                    print(f"     📏 长度: {len(doc_info['content'])} 字符")
+                    print(f"     📝 内容:")
+                    # 显示前300字符的内容
+                    content_preview = doc_info['content'][:300]
+                    if len(doc_info['content']) > 300:
+                        content_preview += "..."
+                    
+                    # 逐行显示，每行添加缩进
+                    for line in content_preview.split('\n'):
+                        print(f"        {line}")
+                    print()
+            
+            print("="*80)
+            
+        except Exception as e:
+            print(f"❌ 打印数据库内容失败: {str(e)}")
+            print("="*80)
 
 # 主应用
 def main():
@@ -714,6 +854,51 @@ def main():
         
         # 将调试模式状态保存到session state
         st.session_state.debug_mode = debug_mode
+        
+        # 数据库管理
+        st.subheader("🗃️ 数据库管理")
+        db_info = processor.get_database_info()
+        st.info(f"数据库文档数: {db_info['total_documents']}")
+        
+        col_db1, col_db2 = st.columns(2)
+        with col_db1:
+            if st.button("📊 查看数据库内容"):
+                processor.print_database_contents()
+                st.success("✅ 数据库内容已打印到控制台")
+        
+        with col_db2:
+            if st.button("🗑️ 清空数据库"):
+                try:
+                    # 删除集合中的所有文档
+                    all_ids = processor.collection.get()["ids"]
+                    if all_ids:
+                        processor.collection.delete(ids=all_ids)
+                        st.success("✅ 数据库已清空")
+                    else:
+                        st.info("ℹ️ 数据库已经是空的")
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"❌ 清空数据库失败: {str(e)}")
+        
+        # 显示数据库内容概要
+        if db_info['total_documents'] > 0:
+            with st.expander("🔍 数据库内容预览", expanded=False):
+                st.write(f"**总文档数:** {db_info['total_documents']}")
+                
+                # 显示示例文档
+                for i, (doc, metadata, doc_id) in enumerate(zip(
+                    db_info['sample_documents'][:3], 
+                    db_info['sample_metadatas'][:3], 
+                    db_info['sample_ids'][:3]
+                )):
+                    st.write(f"**文档 {i+1}:**")
+                    st.write(f"- 来源: {metadata.get('source', '未知')}")
+                    st.write(f"- ID: {doc_id}")
+                    st.write(f"- 长度: {len(doc)} 字符")
+                    st.text_area(f"内容预览 {i+1}", doc[:200] + ("..." if len(doc) > 200 else ""), height=100, key=f"db_preview_{i}")
+                
+                if db_info['total_documents'] > 3:
+                    st.write(f"... 还有 {db_info['total_documents'] - 3} 个文档")
     
     # 主内容区域
     col1, col2 = st.columns([1, 1])
