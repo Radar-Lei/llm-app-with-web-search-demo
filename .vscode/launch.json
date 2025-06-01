@@ -1,0 +1,37 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+      {
+          "name": "Debug Streamlit App",
+          "type": "python",
+          "request": "launch",
+          "program": "${workspaceFolder}/app.py",
+          "args": [],
+          "console": "integratedTerminal",
+          "env": {
+              "PYTHONPATH": "${workspaceFolder}"
+          },
+          "justMyCode": false,
+          "python": "${command:python.interpreterPath}"
+      },
+      {
+          "name": "Debug Streamlit with Module",
+          "type": "python",
+          "request": "launch",
+          "module": "streamlit",
+          "args": [
+              "run",
+              "${workspaceFolder}/app.py",
+              "--server.port",
+              "8501",
+              "--server.headless",
+              "true"
+          ],
+          "console": "integratedTerminal",
+          "env": {
+              "PYTHONPATH": "${workspaceFolder}"
+          },
+          "justMyCode": false
+      }
+  ]
+}

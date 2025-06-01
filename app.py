@@ -167,7 +167,7 @@ def add_to_vector_database(results: list[CrawlResult]):
         text_splitter = RecursiveCharacterTextSplitter(
             chunk_size=400,
             chunk_overlap=100,
-            separators=["\n\n", "\n", ".", "?", "!", " ", ""],
+            separators=["\n\n", "\n", "。", "？", "！", " ", "", ".", ","]
         )
         if result.markdown_v2:
             markdown_result = result.markdown_v2.fit_markdown
@@ -215,10 +215,10 @@ async def crawl_webpages(urls: list[str], prompt: str) -> CrawlResult:
         Runs in headless browser mode with text-only extraction.
     """
     if re.search(r'[\u4e00-\u9fff]', prompt):
-        bm25_filter = BM25ContentFilter(user_query=prompt, bm25_threshold=0.8)
+        bm25_filter = BM25ContentFilter(user_query=prompt, bm25_threshold=0.3)
     else:
         bm25_filter = BM25ContentFilter(user_query=prompt, bm25_threshold=1.2)
-        
+
     md_generator = DefaultMarkdownGenerator(content_filter=bm25_filter)
 
     crawler_config = CrawlerRunConfig(
