@@ -20,7 +20,6 @@ from crawl4ai.markdown_generation_strategy import DefaultMarkdownGenerator
 from crawl4ai.models import CrawlResult
 from langchain_community.document_loaders import UnstructuredMarkdownLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
-import re
 
 system_prompt = """
 You are an AI assistant tasked with providing detailed answers based solely on the given context.
@@ -160,28 +159,39 @@ def add_to_vector_database(results: list[CrawlResult]):
         - Upserts documents, metadata and IDs to ChromaDB collection
     """
     collection, _ = get_vector_collection()
+    total_documents = 0
 
     for result in results:
         documents, metadatas, ids = [], [], []
 
+        # 优化中文文本分割器配置
         text_splitter = RecursiveCharacterTextSplitter(
-            chunk_size=400,
-            chunk_overlap=100,
-            separators=["\n\n", "\n", "。", "？", "！", " ", "", ".", ","]
+            chunk_size=500,  # 增加块大小
+            chunk_overlap=150,  # 增加重叠
+            separators=["\n\n", "\n", "。", "？", "！", ". ", ", ", " ", ""]  # 优化分隔符顺序
         )
-        if result.markdown_v2:
+        
+        if result.markdown_v2 and result.markdown_v2.fit_markdown:
             markdown_result = result.markdown_v2.fit_markdown
+            print(f"处理 URL: {result.url}, 原始内容长度: {len(markdown_result)}")
         else:
+            print(f"跳过 URL: {result.url}, 无内容")
             continue
 
-        temp_file = tempfile.NamedTemporaryFile("w", suffix=".md", delete=False)
+        temp_file = tempfile.NamedTemporaryFile("w", suffix=".md", delete=False, encoding='utf-8')
         temp_file.write(markdown_result)
         temp_file.flush()
 
-        loader = UnstructuredMarkdownLoader(temp_file.name, mode="single")
-        docs = loader.load()
-        all_splits = text_splitter.split_documents(docs)
-        os.unlink(temp_file.name)  # Delete the temporary file
+        try:
+            loader = UnstructuredMarkdownLoader(temp_file.name, mode="single")
+            docs = loader.load()
+            all_splits = text_splitter.split_documents(docs)
+            print(f"文本分割结果: {len(all_splits)} 个块")
+        except Exception as e:
+            print(f"处理文档时出错: {e}")
+            all_splits = []
+        finally:
+            os.unlink(temp_file.name)  # Delete the temporary file
 
         normalized_url = normalize_url(result.url)
 
@@ -191,12 +201,17 @@ def add_to_vector_database(results: list[CrawlResult]):
                 metadatas.append({"source": result.url})
                 ids.append(f"{normalized_url}_{idx}")
 
-            print("Upsert collection: ", id(collection))
+            print(f"向量数据库插入: {len(documents)} 个文档块")
             collection.upsert(
                 documents=documents,
                 metadatas=metadatas,
                 ids=ids,
             )
+            total_documents += len(documents)
+        else:
+            print(f"警告: URL {result.url} 没有生成任何文档块")
+    
+    print(f"总共插入了 {total_documents} 个文档块到向量数据库")
 
 
 async def crawl_webpages(urls: list[str], prompt: str) -> CrawlResult:
@@ -214,12 +229,28 @@ async def crawl_webpages(urls: list[str], prompt: str) -> CrawlResult:
         Configures crawler to exclude navigation elements, forms, images etc.
         Runs in headless browser mode with text-only extraction.
     """
-    if re.search(r'[\u4e00-\u9fff]', prompt):
-        bm25_filter = BM25ContentFilter(user_query=prompt, bm25_threshold=0.3)
+    import re as regex_module  # 避免命名冲突
+    
+    # 中文查询使用更宽松的设置，避免过度过滤
+    is_chinese = regex_module.search(r'[\u4e00-\u9fff]', prompt)
+    
+    if is_chinese:
+        # 对中文查询，使用很低的阈值或不使用BM25过滤器
+        bm25_filter = BM25ContentFilter(user_query=prompt, bm25_threshold=0.1)
+        print(f"使用中文BM25过滤器，阈值: 0.1, 查询: {prompt}")
     else:
         bm25_filter = BM25ContentFilter(user_query=prompt, bm25_threshold=1.2)
+        print(f"使用英文BM25过滤器，阈值: 1.2, 查询: {prompt}")
 
-    md_generator = DefaultMarkdownGenerator(content_filter=bm25_filter)
+    # 对于中文查询，我们可能需要考虑使用不同的markdown生成策略
+    if is_chinese:
+        # 为中文使用更宽松的markdown生成策略
+        md_generator = DefaultMarkdownGenerator(
+            content_filter=bm25_filter,
+            # 不要太严格地过滤内容
+        )
+    else:
+        md_generator = DefaultMarkdownGenerator(content_filter=bm25_filter)
 
     crawler_config = CrawlerRunConfig(
         markdown_generator=md_generator,
@@ -236,6 +267,27 @@ async def crawl_webpages(urls: list[str], prompt: str) -> CrawlResult:
 
     async with AsyncWebCrawler(config=browser_config) as crawler:
         results = await crawler.arun_many(urls, config=crawler_config)
+        
+        # 添加调试信息
+        for i, result in enumerate(results):
+            if result.markdown_v2 and result.markdown_v2.fit_markdown:
+                content_length = len(result.markdown_v2.fit_markdown)
+                print(f"爬取结果 {i+1}: URL={result.url[:50]}..., 内容长度={content_length}")
+                
+                # 如果中文查询的内容太少，尝试使用原始内容
+                if is_chinese and content_length < 50:
+                    print(f"中文内容太少，尝试使用原始markdown...")
+                    if hasattr(result, 'markdown') and result.markdown:
+                        result.markdown_v2.fit_markdown = result.markdown
+                        print(f"使用原始markdown，长度: {len(result.markdown)}")
+                    elif hasattr(result, 'cleaned_html') and result.cleaned_html:
+                        # 如果有清理过的HTML，转换为简单文本
+                        text = regex_module.sub(r'<[^>]+>', '', result.cleaned_html)
+                        result.markdown_v2.fit_markdown = text
+                        print(f"使用清理过的HTML转文本，长度: {len(text)}")
+            else:
+                print(f"爬取结果 {i+1}: URL={result.url[:50]}..., 内容为空")
+        
         return results
 
 
@@ -267,7 +319,7 @@ def check_robots_txt(urls: list[str]) -> list[str]:
     return allowed_urls
 
 
-async def get_web_urls(search_term: str, num_results: int = 10) -> list[str]:
+async def get_web_urls(search_term: str, num_results: int = 20) -> list[str]:
     """使用 crawl4ai 通过 Bing 搜索并返回过滤后的 URL。
 
     使用无头浏览器访问 Bing 搜索页面，解析搜索结果并提取链接，
@@ -434,7 +486,7 @@ def extract_bing_links(html: str, max_results: int = 10) -> list[str]:
 async def run():
     st.set_page_config(page_title="LLM with Web Search")
 
-    st.header("🔍 LLM Web Search")
+    st.header("🔍 大模型+网络搜索LLM Web Search")
     prompt = st.text_area(
         label="Put your query here",
         placeholder="Add your query...",
@@ -449,21 +501,40 @@ async def run():
 
     if prompt and go:
         if is_web_search:
+            st.write(f"🔍 开始搜索: {prompt}")
+            
             web_urls = await get_web_urls(search_term=prompt)
             if not web_urls:
-                st.write("No results found.")
+                st.write("❌ 未找到搜索结果。")
                 st.stop()
 
+            st.write(f"📝 找到 {len(web_urls)} 个URL，开始爬取...")
             results = await crawl_webpages(urls=web_urls, prompt=prompt)
+            
+            st.write("💾 将内容添加到向量数据库...")
             add_to_vector_database(results)
 
+            st.write("🔎 从向量数据库查询相关内容...")
             qresults = collection.query(query_texts=[prompt], n_results=10)
-            context = qresults.get("documents")[0]
+            context_docs = qresults.get("documents")[0] if qresults.get("documents") else []
+            
+            # 添加详细的调试信息
+            print(f"向量查询结果: {len(context_docs)} 个文档")
+            if context_docs:
+                total_context_length = sum(len(doc) for doc in context_docs)
+                print(f"上下文总长度: {total_context_length} 字符")
+                context = " ".join(context_docs)
+                st.write(f"✅ 找到 {len(context_docs)} 个相关文档片段，总长度: {total_context_length} 字符")
+            else:
+                context = ""
+                st.write("⚠️ 警告: 未找到相关的上下文内容")
+                print("警告: 向量查询返回空结果")
 
             chroma_client.delete_collection(
                 name="web_llm"
             )  # Delete collection after use
 
+            st.write("🤖 生成回答...")
             llm_response = call_llm(
                 context=context, prompt=prompt, with_context=is_web_search
             )
